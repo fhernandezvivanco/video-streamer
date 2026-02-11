@@ -11,10 +11,12 @@ import redis
 import json
 import base64
 from datetime import datetime
+from redis.exceptions import ConnectionError as RedisConnectionError
 import cv2
 import numpy as np
 
 from typing import Union, IO, Tuple
+from urllib.parse import urlparse
 
 from PIL import Image
 
@@ -324,44 +326,333 @@ class RedisCamera(Camera):
         self._in_redis_client = self._connect(self._device_uri)
         self._last_frame_number = -1
         self._in_redis_channel = in_redis_channel
+        self._last_redis_drop_log_ts = 0.0
+        self._md3_cam_prefix = (
+            in_redis_channel.rsplit(":", 1)[0]
+            if isinstance(in_redis_channel, str) and in_redis_channel.endswith(":RAW")
+            else None
+        )
+        self._md3_header_format = "<HiiHHQH"
+        self._md3_header_size = struct.calcsize(self._md3_header_format)
+        self._ensure_md3_video_live()
         self._set_size()
+
+    def _log_redis_drop(self, context: str, exc: Exception) -> None:
+        if self._debug:
+            logging.exception("Redis connection dropped %s", context)
+        else:
+            # Rate-limit warnings to avoid log spam during reconnect loops.
+            now = time.time()
+            if now - self._last_redis_drop_log_ts >= 5:
+                logging.warning("Redis connection dropped %s: %s", context, exc)
+                self._last_redis_drop_log_ts = now
+
+    def _ensure_md3_video_live(self) -> None:
+        """MD3 servers typically require setting `video_live=1` to start streaming.
+
+        If the input channel looks like `<cam>:RAW`, we publish to `<cam>:SET:video_live`.
+        """
+        if not self._md3_cam_prefix:
+            return
+
+        cmd_channel = f"{self._md3_cam_prefix}:SET:video_live"
+        attr_channel = f"{self._md3_cam_prefix}:ATTR:video_live"
+        try:
+            self._in_redis_client.ping()
+            attr_pubsub = self._in_redis_client.pubsub()
+            attr_pubsub.subscribe(attr_channel)
+            self._in_redis_client.publish(cmd_channel, 1)
+
+            start = time.perf_counter()
+            while time.perf_counter() - start < 2:
+                msg = attr_pubsub.get_message(timeout=0.2)
+                if msg and msg.get("type") == "message":
+                    data = msg.get("data")
+                    if data == b"OK" or data == "OK":
+                        break
+            try:
+                attr_pubsub.close()
+            except Exception:
+                pass
+        except Exception:
+            # Best-effort only; MD3 servers may not expose the control channels.
+            if self._debug:
+                logging.exception("Failed to set MD3 video_live")
+
+    def _decode_encoded_image_to_rgb24(self, image: bytes) -> Tuple[bytes, int, int]:
+        image_array = np.frombuffer(image, dtype=np.uint8)
+        frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("Could not decode image bytes")
+        height, width = frame.shape[:2]
+        rgb24 = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).tobytes()
+        return rgb24, int(width), int(height)
 
     def _set_size(self):
         # the size is send via redis, hence we get the information from there
-        pubsub = self._in_redis_client.pubsub()
-        pubsub.subscribe(self._in_redis_channel)
+        backoff_s = 0.5
         while True:
-            message = pubsub.get_message()
-            if message and message["type"] == "message":
-                frame = json.loads(message["data"])
-                self._width = frame["size"][1]
-                self._height = frame["size"][0]
-                break
+            pubsub = None
+            try:
+                self._ensure_md3_video_live()
+                pubsub = self._in_redis_client.pubsub(ignore_subscribe_messages=True)
+                pubsub.subscribe(self._in_redis_channel)
+                while True:
+                    try:
+                        message = pubsub.get_message(timeout=1.0)
+                    except TypeError:
+                        message = pubsub.get_message()
+                        time.sleep(0.01)
+
+                    if not message or message.get("type") != "message":
+                        continue
+
+                    data = message.get("data")
+                    if data is None or isinstance(data, int):
+                        continue
+
+                    # 1) Preferred format: JSON string with {"data": <base64>, "size": (w,h) or (h,w), ...}
+                    try:
+                        if isinstance(data, str):
+                            frame = json.loads(data)
+                        elif isinstance(data, (bytes, bytearray)):
+                            stripped = bytes(data).lstrip()
+                            if stripped.startswith((b"{", b"[")):
+                                frame = json.loads(stripped)
+                            else:
+                                frame = None
+                        else:
+                            frame = None
+                    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+                        frame = None
+
+                    if isinstance(frame, dict) and "size" in frame:
+                        # Keep backward-compatible behaviour (existing code assumes size is (h, w)).
+                        self._width = frame["size"][1]
+                        self._height = frame["size"][0]
+                        return
+
+                    # 2) MD3/Arinax RAW format: binary header + raw bytes on channel like "bzoom:RAW"
+                    if isinstance(data, (bytes, bytearray)) and len(data) >= self._md3_header_size:
+                        try:
+                            _, width, height, _, _, _, _ = struct.unpack(
+                                self._md3_header_format, data[: self._md3_header_size]
+                            )
+                        except struct.error:
+                            continue
+
+                        if width > 0 and height > 0:
+                            self._width = int(width)
+                            self._height = int(height)
+                            return
+
+                    # 3) Raw encoded image bytes (JPEG/PNG/...) published directly (non-JSON)
+                    if isinstance(data, (bytes, bytearray)):
+                        try:
+                            _rgb24, width, height = self._decode_encoded_image_to_rgb24(bytes(data))
+                        except Exception:
+                            continue
+                        else:
+                            if width > 0 and height > 0:
+                                self._width = int(width)
+                                self._height = int(height)
+                                return
+
+            except RedisConnectionError as exc:
+                self._log_redis_drop("while probing size; reconnecting", exc)
+                time.sleep(backoff_s)
+                backoff_s = min(backoff_s * 1.5, 10)
+                self._in_redis_client = self._connect(self._device_uri)
+                continue
+            finally:
+                if pubsub is not None:
+                    try:
+                        pubsub.close()
+                    except Exception:
+                        pass
 
     def _connect(self, device_uri: str):
-        host, port = device_uri.replace('redis://', '').split(':')
-        port = port.split('/')[0]
-        return redis.StrictRedis(host=host, port=port)
+        parsed = urlparse(device_uri)
+        if parsed.scheme and parsed.scheme != "redis":
+            raise ValueError(f"Unsupported Redis URI scheme: {parsed.scheme}")
+
+        host = parsed.hostname
+        port = parsed.port
+        username = parsed.username
+        password = parsed.password
+        db = int(parsed.path.lstrip("/") or 0) if parsed.scheme else 0
+
+        # Fallback for bare host:port without scheme
+        if host is None or port is None:
+            endpoint = device_uri.replace("redis://", "")
+            host_part, port_part = endpoint.split(":", 1)
+            host = host_part
+            port = int(port_part.split("/", 1)[0])
+
+        # If parsing the db from URI path failed above due to bare host:port,
+        # fall back to db=0.
+        if not isinstance(db, int):
+            db = 0
+
+        return redis.StrictRedis(
+            host=host,
+            port=int(port),
+            username=username,
+            password=password,
+            db=db,
+            socket_keepalive=True,
+            socket_connect_timeout=5,
+            # Pub/Sub reads can block for a long time.
+            socket_timeout=None,
+            # Keep the TCP connection alive and detect stale connections.
+            health_check_interval=30,
+            retry_on_timeout=True,
+            decode_responses=False,
+        )
 
     def poll_image(self, output: Union[IO, multiprocessing.queues.Queue]) -> None:
-        pubsub = self._in_redis_client.pubsub()
-        pubsub.subscribe(self._in_redis_channel)
         self._output = output
-        for message in pubsub.listen():
-            if message["type"] == "message":
-                frame = json.loads(message["data"])
-                self._last_frame_number += 1
-                if self._redis:
-                    frame_dict = {
-                        "data": frame["data"],
-                        "size": frame["size"],
-                        "time": datetime.now().strftime("%H:%M:%S.%f"),
-                        "frame_number": self._last_frame_number
-                    }
-                    self._redis_client.publish(self._redis_channel, json.dumps(frame_dict))
-                
-                raw_image_data = base64.b64decode(frame["data"])                
-                self._write_data(self._image_to_rgb24(raw_image_data))
+        backoff_s = 0.5
+        while True:
+            pubsub = None
+            try:
+                self._ensure_md3_video_live()
+                pubsub = self._in_redis_client.pubsub(ignore_subscribe_messages=True)
+                pubsub.subscribe(self._in_redis_channel)
+                while True:
+                    message = pubsub.get_message(timeout=1.0)
+                    if not message:
+                        continue
+
+                    data = message.get("data")
+                    if data is None or isinstance(data, int):
+                        continue
+
+                    # Try JSON frame first
+                    try:
+                        if isinstance(data, str):
+                            frame = json.loads(data)
+                        elif isinstance(data, (bytes, bytearray)):
+                            stripped = bytes(data).lstrip()
+                            if stripped.startswith((b"{", b"[")):
+                                frame = json.loads(stripped)
+                            else:
+                                frame = None
+                        else:
+                            frame = None
+                    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+                        frame = None
+
+                    if isinstance(frame, dict) and "data" in frame and "size" in frame:
+                        self._last_frame_number += 1
+                        if self._redis:
+                            frame_dict = {
+                                "data": frame["data"],
+                                "size": frame["size"],
+                                "time": datetime.now().strftime("%H:%M:%S.%f"),
+                                "frame_number": self._last_frame_number,
+                            }
+                            self._redis_client.publish(self._redis_channel, json.dumps(frame_dict))
+
+                        raw_image_data = base64.b64decode(frame["data"])
+                        self._write_data(self._image_to_rgb24(raw_image_data))
+                        continue
+
+                    # Fallback: MD3 binary RAW frame
+                    if not isinstance(data, (bytes, bytearray)) or len(data) < self._md3_header_size:
+                        # Final fallback: raw encoded image bytes (JPEG/PNG/...) or raw RGB24 without header
+                        if isinstance(data, (bytes, bytearray)):
+                            # If size is known, allow direct RGB24 payload (no header)
+                            if self._width > 0 and self._height > 0:
+                                expected_rgb = int(self._width) * int(self._height) * 3
+                                if len(data) >= expected_rgb:
+                                    rgb24 = bytes(data[:expected_rgb])
+                                    self._last_frame_number += 1
+                                    if self._redis:
+                                        frame_dict = {
+                                            "data": base64.b64encode(rgb24).decode("utf-8"),
+                                            "size": (int(self._width), int(self._height)),
+                                            "time": datetime.now().strftime("%H:%M:%S.%f"),
+                                            "frame_number": self._last_frame_number,
+                                        }
+                                        self._redis_client.publish(self._redis_channel, json.dumps(frame_dict))
+                                    self._write_data(bytearray(rgb24))
+                                    continue
+
+                            # Otherwise try to decode it as an encoded image
+                            try:
+                                rgb24, width, height = self._decode_encoded_image_to_rgb24(bytes(data))
+                            except Exception:
+                                continue
+                            else:
+                                self._width = width
+                                self._height = height
+                                self._last_frame_number += 1
+                                if self._redis:
+                                    frame_dict = {
+                                        "data": base64.b64encode(rgb24).decode("utf-8"),
+                                        "size": (width, height),
+                                        "time": datetime.now().strftime("%H:%M:%S.%f"),
+                                        "frame_number": self._last_frame_number,
+                                    }
+                                    self._redis_client.publish(self._redis_channel, json.dumps(frame_dict))
+                                self._write_data(bytearray(rgb24))
+                                continue
+
+                        continue
+
+                    try:
+                        _, width, height, _, _, _, _ = struct.unpack(
+                            self._md3_header_format, data[: self._md3_header_size]
+                        )
+                    except struct.error:
+                        continue
+
+                    width = int(width)
+                    height = int(height)
+                    payload = bytes(data[self._md3_header_size :])
+
+                    if width <= 0 or height <= 0:
+                        continue
+
+                    expected_rgb = width * height * 3
+                    expected_gray = width * height
+
+                    if len(payload) >= expected_rgb:
+                        rgb24 = payload[:expected_rgb]
+                    elif len(payload) >= expected_gray:
+                        gray = Image.frombytes("L", (width, height), payload[:expected_gray])
+                        rgb24 = gray.convert("RGB").tobytes()
+                    else:
+                        continue
+
+                    self._width = width
+                    self._height = height
+                    self._last_frame_number += 1
+
+                    if self._redis:
+                        frame_dict = {
+                            "data": base64.b64encode(rgb24).decode("utf-8"),
+                            "size": (width, height),
+                            "time": datetime.now().strftime("%H:%M:%S.%f"),
+                            "frame_number": self._last_frame_number,
+                        }
+                        self._redis_client.publish(self._redis_channel, json.dumps(frame_dict))
+
+                    self._write_data(bytearray(rgb24))
+
+            except RedisConnectionError as exc:
+                self._log_redis_drop("while listening; reconnecting", exc)
+                time.sleep(backoff_s)
+                backoff_s = min(backoff_s * 1.5, 10)
+                self._in_redis_client = self._connect(self._device_uri)
+                continue
+            finally:
+                if pubsub is not None:
+                    try:
+                        pubsub.close()
+                    except Exception:
+                        pass
 
 class TestCamera(Camera):
     def __init__(self, device_uri: str, sleep_time: float, debug: bool = False, redis: str = None, redis_channel: str = None):
