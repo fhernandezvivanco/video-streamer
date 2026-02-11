@@ -324,7 +324,11 @@ class RedisCamera(Camera):
         self._in_redis_client = self._connect(self._device_uri)
         self._last_frame_number = -1
         self._in_redis_channel = in_redis_channel
+
+        self._md3_header_format = "<HiiHHQH"
+        self._md3_header_size = struct.calcsize(self._md3_header_format)
         self._set_size()
+
 
     def _set_size(self):
         # the size is send via redis, hence we get the information from there
@@ -333,9 +337,12 @@ class RedisCamera(Camera):
         while True:
             message = pubsub.get_message()
             if message and message["type"] == "message":
-                frame = json.loads(message["data"])
-                self._width = frame["size"][1]
-                self._height = frame["size"][0]
+                # frame = json.loads(message["data"])
+                _, width, height, _, _, _, _ = struct.unpack(
+                self._md3_header_format, message["data"][: self._md3_header_size]
+        )
+                # raw = message["data"][self._md3_header_size :]
+                self._width, self._height = width, height
                 break
 
     def _connect(self, device_uri: str):
@@ -349,19 +356,45 @@ class RedisCamera(Camera):
         self._output = output
         for message in pubsub.listen():
             if message["type"] == "message":
-                frame = json.loads(message["data"])
+                #frame = json.loads(message["data"])
+                data = message["data"]
+
+                _, width, height, _, _, _, _ = struct.unpack(
+                    self._md3_header_format, data[: self._md3_header_size]
+                )
+
+
+                payload = data[self._md3_header_size :]
+
+                expected_rgb = width * height * 3
+                expected_gray = width * height
+
+                if len(payload) >= expected_rgb:
+                    rgb24 = payload[:expected_rgb]
+                elif len(payload) >= expected_gray:
+                    gray = Image.frombytes("L", (width, height), payload[:expected_gray])
+                    rgb24 = gray.convert("RGB").tobytes()
+                else:
+                    continue
+
+                self._width = width
+                self._height = height
                 self._last_frame_number += 1
+
                 if self._redis:
                     frame_dict = {
-                        "data": frame["data"],
-                        "size": frame["size"],
+                        "data": base64.b64encode(rgb24).decode("utf-8"),
+                        "size": (width, height),
                         "time": datetime.now().strftime("%H:%M:%S.%f"),
-                        "frame_number": self._last_frame_number
+                        "frame_number": self._last_frame_number,
                     }
                     self._redis_client.publish(self._redis_channel, json.dumps(frame_dict))
+
+                self._write_data(bytearray(rgb24))
                 
-                raw_image_data = base64.b64decode(frame["data"])                
-                self._write_data(self._image_to_rgb24(raw_image_data))
+                
+                #raw_image_data = base64.b64decode(raw)                
+                # self._write_data(self._image_to_rgb24(raw))
 
 class TestCamera(Camera):
     def __init__(self, device_uri: str, sleep_time: float, debug: bool = False, redis: str = None, redis_channel: str = None):
