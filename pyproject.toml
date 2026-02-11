@@ -28,8 +28,8 @@ fastapi = { version = "^0.124.0", extras = ["standard-no-fastapi-cloud-cli"] }
 numpy = ">=2.0"
 opencv-python = "^4.10.0.84"
 pillow = "^10.4.0"
-pydantic = ">=2.8.2"
-pydantic-core = "2.20.1"
+pydantic = ">=2.7.0"
+pydantic-core = ">=2.20.1"
 pydantic-settings = ">=2.4.0"
 pytango = {version = "^9.3.6", optional = true}
 redis = ">=5.0.0"

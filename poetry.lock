@@ -2246,4 +2246,4 @@ tango = ["pytango"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.12"
-content-hash = "e6b2fed3a4e4f04c443eb56833d655719f0dd335e014f5a119b05358e30b4786"
+content-hash = "f445ffea69d72c6d80776dbe08b8c075a731cc3f82652fc0155bc61ff56ff836"
