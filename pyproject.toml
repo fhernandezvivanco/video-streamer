@@ -32,7 +32,7 @@ pydantic = ">=2.8.2"
 pydantic-core = "2.20.1"
 pydantic-settings = ">=2.4.0"
 pytango = {version = "^9.3.6", optional = true}
-redis = ">=4.3.5,<5.0.0"
+redis = ">=5.0.0"
 requests = "^2.32.4"
 typing-extensions = "^4.14.1"
 uvicorn = { version = "^0.34.0", extras = ["standard"] }
