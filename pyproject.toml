@@ -25,14 +25,14 @@ classifiers = [
 [tool.poetry.dependencies]
 python = ">=3.10,<3.12"
 fastapi = { version = "^0.124.0", extras = ["standard-no-fastapi-cloud-cli"] }
-numpy = ">=1.26.0,<2.0"
+numpy = ">=2.0"
 opencv-python = "^4.10.0.84"
 pillow = "^10.4.0"
-pydantic = ">=2.8.2,<2.9.0"
-pydantic-core = "2.20.1"
+pydantic = ">=2.7.0"
+pydantic-core = ">=2.20.1"
 pydantic-settings = ">=2.4.0"
 pytango = {version = "^9.3.6", optional = true}
-redis = ">=4.3.5,<5.0.0"
+redis = ">=5.0.0"
 requests = "^2.32.4"
 typing-extensions = "^4.14.1"
 uvicorn = { version = "^0.34.0", extras = ["standard"] }
