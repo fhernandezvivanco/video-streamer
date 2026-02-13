@@ -37,6 +37,7 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub uri: String,
+    pub ffmpeg: String,
     pub quality: u8,
     pub size: (u32, u32),
     pub vflip: bool,
@@ -202,7 +203,7 @@ fn start_ffmpeg(config: &ServerConfig) -> Result<Child> {
 
     let url = format!("http://127.0.0.1:{}/video_input/", config.port);
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(&config.ffmpeg);
     cmd.args([
         "-f",
         "rawvideo",
@@ -226,7 +227,16 @@ fn start_ffmpeg(config: &ServerConfig) -> Result<Child> {
     .stdout(Stdio::null())
     .stderr(if config.debug { Stdio::inherit() } else { Stdio::null() });
 
-    cmd.spawn().context("Failed spawning ffmpeg")
+    cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow!(
+                "ffmpeg not found (tried '{}'). Install ffmpeg or pass --ffmpeg /path/to/ffmpeg",
+                config.ffmpeg
+            )
+        } else {
+            anyhow!(e).context("Failed spawning ffmpeg")
+        }
+    })
 }
 
 fn start_camera_writer(

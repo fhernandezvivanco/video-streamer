@@ -17,6 +17,9 @@ The binary will be at:
 
 ## Run (Rust-only server, no Python)
 
+Prerequisite: `ffmpeg` must be installed and available in `PATH`.
+If it isn’t, pass an explicit path via `--ffmpeg /path/to/ffmpeg`.
+
 MPEG1 only (equivalent endpoints to the FastAPI server):
 
 - `GET /ui` (HTML player)

@@ -59,6 +59,10 @@ enum Command {
         #[arg(long, default_value = "test")]
         uri: String,
 
+        /// ffmpeg binary (defaults to `ffmpeg` in PATH)
+        #[arg(long, default_value = "ffmpeg")]
+        ffmpeg: String,
+
         #[arg(long, default_value_t = 4)]
         quality: u8,
 
@@ -102,6 +106,7 @@ async fn main() -> Result<()> {
             host,
             port,
             uri,
+            ffmpeg,
             quality,
             size,
             vflip,
@@ -115,6 +120,7 @@ async fn main() -> Result<()> {
                 host,
                 port,
                 uri,
+                ffmpeg,
                 quality,
                 size: (w, h),
                 vflip,
