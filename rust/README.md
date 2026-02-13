@@ -1,6 +1,9 @@
 # Rust camera producers
 
-This folder contains a small Rust binary used by the Python project for fast frame acquisition.
+This folder contains a Rust binary that can either:
+
+- run the full MPEG1 HTTP+WebSocket server (no Python), or
+- act as a frame producer (used previously by the Python project).
 
 ## Build
 
@@ -11,6 +14,23 @@ From the repo root:
 The binary will be at:
 
 - `rust/target/release/video_streamer_camera`
+
+## Run (Rust-only server, no Python)
+
+MPEG1 only (equivalent endpoints to the FastAPI server):
+
+- `GET /ui` (HTML player)
+- `GET /static/jsmpeg.min.js`
+- `POST /video_input/` (ffmpeg pushes MPEG-TS here)
+- `WS /ws/{hash}` (browser connects here)
+
+Example (test image):
+
+- `./rust/target/release/video_streamer_camera server --host 0.0.0.0 --port 8000 --uri test --hash stream`
+
+Example (Redis pubsub):
+
+- `./rust/target/release/video_streamer_camera server --port 8000 --uri redis://localhost:6379/ --in-redis-channel CameraStream --hash stream`
 
 ## Run (manual)
 

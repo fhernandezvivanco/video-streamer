@@ -10,6 +10,14 @@ clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 redis = "0.25"
 
+axum = { version = "0.7", features = ["ws"] }
+bytes = "1"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.5", features = ["fs"] }
+
 [profile.release]
 codegen-units = 1
 lto = true

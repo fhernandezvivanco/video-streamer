@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod redis_camera;
+mod server;
 mod test_camera;
 
 #[derive(Parser, Debug)]
@@ -45,9 +46,45 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         sleep_ms: u64,
     },
+
+    /// Run the MPEG1 HTTP+WebSocket server (replacement for FastAPI)
+    Server {
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+
+        #[arg(long, default_value_t = 8000)]
+        port: u16,
+
+        /// Input source: "test" or "redis://host:port/"
+        #[arg(long, default_value = "test")]
+        uri: String,
+
+        #[arg(long, default_value_t = 4)]
+        quality: u8,
+
+        /// Output size (w,h). Use 0,0 for source size.
+        #[arg(long, default_value = "0,0")]
+        size: String,
+
+        #[arg(long, default_value_t = false)]
+        vflip: bool,
+
+        /// Stream id/hash used in the websocket route: /ws/{hash}
+        #[arg(long, default_value = "stream")]
+        hash: String,
+
+        /// Channel for RedisCamera to listen to
+        #[arg(long, default_value = "CameraStream")]
+        in_redis_channel: String,
+
+        /// Enable debug output (prints ffmpeg stderr and server startup info)
+        #[arg(long, default_value_t = false)]
+        debug: bool,
+    },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -60,7 +97,45 @@ fn main() -> Result<()> {
             image_path,
             sleep_ms,
         } => test_loop(image_path, sleep_ms),
+
+        Command::Server {
+            host,
+            port,
+            uri,
+            quality,
+            size,
+            vflip,
+            hash,
+            in_redis_channel,
+            debug,
+        } => {
+            let (w, h) = parse_size(&size)?;
+
+            let cfg = server::ServerConfig {
+                host,
+                port,
+                uri,
+                quality,
+                size: (w, h),
+                vflip,
+                hash,
+                in_redis_channel,
+                debug,
+            };
+            server::run(cfg).await
+        }
     }
+}
+
+fn parse_size(size: &str) -> Result<(u32, u32)> {
+    let parts: Vec<&str> = size.split(',').collect();
+    if parts.len() != 2 {
+        return Err(anyhow::anyhow!("Invalid --size format, expected w,h"));
+    }
+
+    let w: u32 = parts[0].trim().parse().context("Invalid width")?;
+    let h: u32 = parts[1].trim().parse().context("Invalid height")?;
+    Ok((w, h))
 }
 
 fn redis_loop(uri: &str, channel: &str, reconnect_ms: u64) -> Result<()> {

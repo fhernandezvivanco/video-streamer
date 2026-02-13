@@ -88,3 +88,26 @@ pub fn stream_frames(uri: &str, channel: &str, out: &mut impl Write) -> Result<(
         }
     }
 }
+
+pub fn probe_size(uri: &str, channel: &str) -> Result<(u32, u32)> {
+    let client = redis::Client::open(uri).with_context(|| format!("Invalid redis uri: {uri}"))?;
+    let mut conn = client
+        .get_connection()
+        .with_context(|| format!("Failed connecting to redis at {uri}"))?;
+
+    let mut pubsub = conn.as_pubsub();
+    pubsub
+        .subscribe(channel)
+        .with_context(|| format!("Failed subscribing to channel {channel}"))?;
+
+    loop {
+        let msg = pubsub.get_message().context("Failed receiving redis pubsub message")?;
+        let data = msg.get_payload_bytes();
+        if data.len() < MD3_HEADER_SIZE {
+            continue;
+        }
+        if let Ok(header) = parse_header(data) {
+            return Ok((header.width as u32, header.height as u32));
+        }
+    }
+}
