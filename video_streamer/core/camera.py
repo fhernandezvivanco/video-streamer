@@ -4,6 +4,7 @@ import struct
 import sys
 import os
 import io
+import subprocess
 import multiprocessing
 import multiprocessing.queues
 import requests
@@ -25,6 +26,62 @@ from video_streamer.core.config import AuthenticationConfiguration
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def _repo_root() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def _rust_camera_bin_path() -> str:
+    # Allow overriding the binary path (useful for packaging / CI).
+    override = os.environ.get("VIDEO_STREAMER_RUST_CAMERA_BIN")
+    if override:
+        return override
+
+    # Default: cargo build output
+    bin_name = "video_streamer_camera"
+    return os.path.join(_repo_root(), "rust", "target", "release", bin_name)
+
+
+def _ensure_rust_camera_binary() -> str:
+    bin_path = _rust_camera_bin_path()
+    if os.path.exists(bin_path) and os.access(bin_path, os.X_OK):
+        return bin_path
+
+    manifest = os.path.join(_repo_root(), "rust", "Cargo.toml")
+    logger.info("Rust camera binary not found; building via cargo: %s", manifest)
+
+    try:
+        subprocess.run(
+            ["cargo", "build", "--release", "--manifest-path", manifest],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "cargo not found in PATH; build rust/video_streamer_camera first "
+            "or set VIDEO_STREAMER_RUST_CAMERA_BIN"
+        ) from e
+
+    if not (os.path.exists(bin_path) and os.access(bin_path, os.X_OK)):
+        raise RuntimeError(f"Rust camera binary not executable: {bin_path}")
+
+    return bin_path
+
+
+def _read_exact(stream: Any, n: int) -> Optional[bytes]:
+    """Read exactly n bytes from a file-like object; return None on EOF."""
+    buf = bytearray(n)
+    view = memoryview(buf)
+    pos = 0
+    while pos < n:
+        chunk = stream.read(n - pos)
+        if not chunk:
+            return None
+        view[pos : pos + len(chunk)] = chunk
+        pos += len(chunk)
+    return bytes(buf)
 
 class Camera:
     def __init__(self, device_uri: str, sleep_time: float, debug: bool = False, redis: str = None, redis_channel: str = None):
@@ -390,55 +447,55 @@ class RedisCamera(Camera):
 
     def poll_image(self, output: Union[IO, multiprocessing.queues.Queue]) -> None:
         self._output = output
-        # Create the Redis pubsub connection in the *child* process.
-        with self._managed_pubsub(self._device_uri) as pubsub:
-            pubsub.subscribe(self._in_redis_channel)
 
+        # Heavy lifting (redis pubsub + gray->rgb conversion) is done in Rust.
+        # This Python process just forwards fixed-size rgb24 frames into ffmpeg.
+        bin_path = _ensure_rust_camera_binary()
+        frame_size = int(self._width * self._height * 3)
+        if frame_size <= 0:
+            raise RuntimeError(f"Invalid RedisCamera frame size: {self._width}x{self._height}")
+
+        proc = subprocess.Popen(
+            [
+                bin_path,
+                "redis",
+                "--uri",
+                self._device_uri,
+                "--channel",
+                self._in_redis_channel,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL if not self._debug else None,
+            bufsize=0,
+        )
+
+        assert proc.stdout is not None
+
+        try:
+            while True:
+                frame = _read_exact(proc.stdout, frame_size)
+                if frame is None:
+                    break
+
+                self._last_frame_number += 1
+                self._write_data(bytearray(frame))
+        except KeyboardInterrupt:
+            sys.exit(0)
+        except BrokenPipeError:
+            logger.info(
+                f"RedisCamera stream ended (broken pipe). Frame number: {self._last_frame_number}"
+            )
+            sys.exit(0)
+        except Exception:
+            logger.exception(
+                "RedisCamera encountered an error during streaming."
+                f" Frame number: {self._last_frame_number}"
+            )
+        finally:
             try:
-                for message in pubsub.listen():
-                    if message.get("type") != "message":
-                        continue
-
-                    data = message["data"]
-                    _, width, height, _, _, _, _ = struct.unpack(
-                        self._md3_header_format,
-                        data[: self._md3_header_size],
-                    )
-
-                    payload = data[self._md3_header_size :]
-
-                    expected_rgb = width * height * 3
-                    expected_gray = width * height
-
-                    if len(payload) >= expected_rgb:
-                        rgb24 = payload[:expected_rgb]
-                    elif len(payload) >= expected_gray:
-                        gray = Image.frombytes(
-                            "L", (width, height), payload[:expected_gray]
-                        )
-                        rgb24 = gray.convert("RGB").tobytes()
-                    else:
-                        continue
-
-                    self._width = width
-                    self._height = height
-                    self._last_frame_number += 1
-
-                    self._write_data(bytearray(rgb24))
-                    logger.debug(f"Received frame {self._last_frame_number} with size ({width}x{height})")
-            except KeyboardInterrupt:
-                sys.exit(0)
-            except BrokenPipeError:
-                logger.info(
-                    f"RedisCamera stream ended (broken pipe). Frame number: {self._last_frame_number}"
-                    )
-
-                sys.exit(0)
+                proc.terminate()
             except Exception:
-                logger.exception(
-                    "RedisCamera encountered an error during streaming."
-                    f" Frame number: {self._last_frame_number}"
-                )
+                pass
                 
                 
                 #raw_image_data = base64.b64decode(raw)                
@@ -456,19 +513,66 @@ class TestCamera(Camera):
         self._last_frame_number = -1
 
     def _poll_once(self) -> None:
+        # Kept for backwards compatibility; the fast path is in poll_image().
         self._write_data(bytearray(self._raw_data))
-        
         self._last_frame_number += 1
-        if self._redis:
-            frame_dict = {
-                "data": base64.b64encode(self._raw_data).decode('utf-8'),
-                "size": self._im.size,
-                "time": datetime.now().strftime("%H:%M:%S.%f"),
-                "frame_number": self._last_frame_number,
-            }
-            self._redis_client.publish(self._redis_channel, json.dumps(frame_dict))
-        
         time.sleep(self._sleep_time)
+
+    def poll_image(self, output: Union[IO, multiprocessing.queues.Queue]) -> None:
+        self._output = output
+        if self._redis:
+            host, port = self._redis.split(':')
+            self._redis_client = redis.StrictRedis(host=host, port=int(port))
+
+        frame_size = int(self._width * self._height * 3)
+        if frame_size <= 0:
+            raise RuntimeError(f"Invalid TestCamera frame size: {self._width}x{self._height}")
+
+        bin_path = _ensure_rust_camera_binary()
+        image_path = os.path.join(os.path.dirname(__file__), "fakeimg.jpg")
+
+        proc = subprocess.Popen(
+            [
+                bin_path,
+                "test",
+                "--image-path",
+                image_path,
+                "--sleep-ms",
+                str(int(self._sleep_time * 1000)),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL if not self._debug else None,
+            bufsize=0,
+        )
+
+        assert proc.stdout is not None
+
+        try:
+            while True:
+                frame = _read_exact(proc.stdout, frame_size)
+                if frame is None:
+                    break
+
+                self._last_frame_number += 1
+                self._write_data(bytearray(frame))
+
+                if self._redis and self._redis_channel is not None:
+                    frame_dict = {
+                        "data": base64.b64encode(frame).decode("utf-8"),
+                        "size": (self._width, self._height),
+                        "time": datetime.now().strftime("%H:%M:%S.%f"),
+                        "frame_number": self._last_frame_number,
+                    }
+                    self._redis_client.publish(self._redis_channel, json.dumps(frame_dict))
+        except KeyboardInterrupt:
+            sys.exit(0)
+        except BrokenPipeError:
+            sys.exit(0)
+        finally:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
 
 class VideoTestCamera(Camera):
     def __init__(self, device_uri: str, sleep_time: float, debug: bool = False, redis: str = None, redis_channel: str = None):

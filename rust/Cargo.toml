@@ -1,0 +1,15 @@
+[package]
+name = "video_streamer_camera"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+byteorder = "1"
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+redis = "0.25"
+
+[profile.release]
+codegen-units = 1
+lto = true
