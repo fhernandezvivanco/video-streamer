@@ -5,9 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-byteorder = "1"
 clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+byteorder = "1"
 redis = "0.25"
 
 axum = { version = "0.7", features = ["ws"] }

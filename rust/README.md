@@ -1,9 +1,6 @@
 # Rust camera producers
 
-This folder contains a Rust binary that can either:
-
-- run the full MPEG1 HTTP+WebSocket server (no Python), or
-- act as a frame producer (used previously by the Python project).
+This folder contains a Rust binary that runs the MPEG1 HTTP+WebSocket server (no Python).
 
 ## Build
 
@@ -29,19 +26,21 @@ MPEG1 only (equivalent endpoints to the FastAPI server):
 
 Example (test image):
 
-- `./rust/target/release/video_streamer_camera server --host 0.0.0.0 --port 8000 --uri test --hash stream`
+`./rust/target/release/video_streamer_camera --host 0.0.0.0 --port 8000 --uri test --hash stream`
 
 Example (Redis pubsub):
 
-- `./rust/target/release/video_streamer_camera server --port 8000 --uri redis://localhost:6379/ --in-redis-channel CameraStream --hash stream`
+`./rust/target/release/video_streamer_camera --port 8000 --uri redis://localhost:6379/ --in-redis-channel CameraStream --hash stream`
+
+## Custom test image (server mode)
+
+To use a specific image when running `--uri test`, pass `--image-path`:
+
+- `./rust/target/release/video_streamer_camera --host 0.0.0.0 --port 8000 --uri test --hash stream --image-path video_streamer/core/fakeimg.jpg`
 
 ## Run (manual)
 
-- Test image loop:
-  - `./rust/target/release/video_streamer_camera test --image-path video_streamer/core/fakeimg.jpg --sleep-ms 50 > /dev/null`
-
-- Redis pubsub:
-  - `./rust/target/release/video_streamer_camera redis --uri redis://localhost:6379/ --channel CameraStream > /dev/null`
+(No additional manual modes; this binary runs the server.)
 
 ## Python integration
 

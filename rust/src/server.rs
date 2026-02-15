@@ -42,13 +42,20 @@ pub struct ServerConfig {
     pub size: (u32, u32),
     pub vflip: bool,
     pub hash: String,
-    pub in_redis_channel: String,
     pub debug: bool,
+    pub image_path: Option<PathBuf>,
+    pub in_redis_channel: String,
 }
 
 pub async fn run(config: ServerConfig) -> Result<()> {
     if config.hash.is_empty() {
-        return Err(anyhow!("--id/--hash must be non-empty"));
+        return Err(anyhow!("--hash must be non-empty"));
+    }
+    if !(config.uri == "test" || config.uri.starts_with("redis")) {
+        return Err(anyhow!(
+            "Unsupported uri (Rust server supports only test and redis://...): {}",
+            config.uri
+        ));
     }
 
     let repo_root = repo_root();
@@ -90,9 +97,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         .with_context(|| format!("Failed binding {addr}"))?;
 
     // Spawn the server.
-    let server_task = tokio::spawn(async move {
-        axum::serve(listener, app).await
-    });
+    let server_task = tokio::spawn(async move { axum::serve(listener, app).await });
 
     // Start ffmpeg + camera after the server is bound.
     let mut ffmpeg = start_ffmpeg(&config).context("Failed starting ffmpeg")?;
@@ -100,7 +105,6 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         .stdin
         .take()
         .ok_or_else(|| anyhow!("Failed to get ffmpeg stdin"))?;
-
     let camera_handle = start_camera_writer(&config, stdin).context("Failed starting camera")?;
 
     // Wait for Ctrl+C.
@@ -109,7 +113,6 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     // Stop camera writer by killing ffmpeg (writer will see BrokenPipe and exit).
     let _ = ffmpeg.kill();
     let _ = ffmpeg.wait();
-
     let _ = camera_handle.join();
 
     // Shut down server task.
@@ -155,9 +158,7 @@ async fn ws_handler(
                 }
                 incoming = receiver.next() => {
                     match incoming {
-                        Some(Ok(axum::extract::ws::Message::Close(_))) | None => {
-                            break;
-                        }
+                        Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
                         Some(Ok(_)) => {}
                         Some(Err(_)) => break,
                     }
@@ -171,7 +172,6 @@ async fn video_input_handler(State(state): State<AppState>, body: Body) -> impl 
     let mut stream = body.into_data_stream();
 
     while let Some(Ok(chunk)) = stream.next().await {
-        // broadcast ignores if no listeners
         let _ = state.broadcaster.send(chunk);
     }
 
@@ -179,15 +179,19 @@ async fn video_input_handler(State(state): State<AppState>, body: Body) -> impl 
 }
 
 fn start_ffmpeg(config: &ServerConfig) -> Result<Child> {
-    // Determine source size (camera size) and output size.
     let source_size = if config.uri == "test" {
-        let repo_root = repo_root();
-        let img_path = repo_root.join("video_streamer/core/fakeimg.jpg");
+        let img_path = config.image_path.clone().unwrap_or_else(|| {
+            let repo_root = repo_root();
+            repo_root.join("video_streamer/core/fakeimg.jpg")
+        });
         test_camera::probe_size(&img_path)?
     } else if config.uri.starts_with("redis") {
         redis_camera::probe_size(&config.uri, &config.in_redis_channel)?
     } else {
-        return Err(anyhow!("Unsupported uri (Rust server supports only test and redis://...): {}", config.uri));
+        return Err(anyhow!(
+            "Unsupported uri (Rust server supports only test and redis://...): {}",
+            config.uri
+        ));
     };
 
     let out_size = if config.size.0 != 0 { config.size } else { source_size };
@@ -244,13 +248,17 @@ fn start_camera_writer(
     mut ffmpeg_stdin: std::process::ChildStdin,
 ) -> Result<thread::JoinHandle<()>> {
     let uri = config.uri.clone();
+    let image_path = config.image_path.clone();
     let channel = config.in_redis_channel.clone();
     let debug = config.debug;
 
     let handle = thread::spawn(move || {
         if uri == "test" {
-            let repo_root = repo_root();
-            let img_path = repo_root.join("video_streamer/core/fakeimg.jpg");
+            let img_path = image_path.unwrap_or_else(|| {
+                let repo_root = repo_root();
+                repo_root.join("video_streamer/core/fakeimg.jpg")
+            });
+
             let (w, h) = match test_camera::probe_size(&img_path) {
                 Ok(s) => s,
                 Err(_) => return,
@@ -288,20 +296,11 @@ fn start_camera_writer(
                         }
 
                         failures += 1;
-
-                        if debug {
-                            // Many installations have transient TCP resets; treat as expected.
-                            // Throttle logging so debug mode remains readable.
-                            if last_log.elapsed() > Duration::from_secs(5) {
-                                eprintln!(
-                                    "Redis stream error (will retry, failures={}): {err:#}",
-                                    failures
-                                );
-                                last_log = Instant::now();
-                            }
+                        if debug && last_log.elapsed() > Duration::from_secs(1) {
+                            eprintln!("Redis camera error (failures={}): {err:#}", failures);
+                            last_log = Instant::now();
                         }
-
-                        thread::sleep(Duration::from_millis(200));
+                        thread::sleep(Duration::from_millis(500));
                     }
                 }
             }
@@ -318,5 +317,3 @@ fn repo_root() -> PathBuf {
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf()
 }
-
-// No env-based overrides needed.
