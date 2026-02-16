@@ -396,13 +396,12 @@ class RedisCamera(Camera):
 
 
     def get_camera_image(self, md3_redis_client: MD3RedisClient) -> bytes:
-        """Get camera image by converting into raw RGB24 format (width*height*3 bytes).
-        If error occurs, a placeholder image is emitted (as JPEG bytes).
+        """Get camera using the MD3Redis client, and convert it to RGB24 bytes.
 
         Returns
         -------
         bytes
-            Returns the image in raw RGB24 format as bytes. If an error occurs, a placeholder image is returned.
+            An image in RGB24 format as bytes
         """
         try:
             imgArray = md3_redis_client.get_frame()
