@@ -363,24 +363,17 @@ class RedisCamera(Camera):
         self._last_frame_number = -1
         self._in_redis_channel = in_redis_channel
 
-        # self._md3_header_format = "<HiiHHQH"
-        # self._md3_header_size = struct.calcsize(self._md3_header_format)
+
         self._set_size()
 
 
     def _set_size(self) -> None:
-        # The size is sent via Redis; we read a single message to discover it.
         with MD3RedisClient(self.camera_args) as md3_redis_client:
             raw, self._width, self._height = md3_redis_client._poll_image(MD3_CAMERA_TIMEOUT)
 
-    # def _connect(self, device_uri: str):
-    #     host, port = device_uri.replace('redis://', '').split(':')
-    #     port = port.split('/')[0]
-    #     return redis.StrictRedis(host=host, port=int(port))
 
     def poll_image(self, output: Union[IO, multiprocessing.queues.Queue]) -> None:
         self._output = output
-        # Create the Redis pubsub connection in the *child* process.
         while True:
             with MD3RedisClient(self.camera_args) as md3_redis_client:
                 while True:
@@ -401,9 +394,7 @@ class RedisCamera(Camera):
                         self._emit_placeholder_image(e)
                         break
 
-                
-                #raw_image_data = base64.b64decode(raw)                
-                # self._write_data(self._image_to_rgb24(raw))
+
     def get_camera_image(self, md3_redis_client: MD3RedisClient) -> bytes:
         """Get camera image by converting into raw RGB24 format (width*height*3 bytes).
         If error occurs, a placeholder image is emitted (as JPEG bytes).
