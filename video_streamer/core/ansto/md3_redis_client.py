@@ -226,7 +226,7 @@ class MD3RedisClient(redis.Redis):
 
 if __name__ == "__main__":
     default_args = {
-        "host": "10.244.101.30",
+        "host": "host",
         "port": 6379,
         "hybrid": "bzoom",
         "first": "acA2500-x5",
