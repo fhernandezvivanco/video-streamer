@@ -22,6 +22,10 @@ from PIL import Image
 
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 from video_streamer.core.config import AuthenticationConfiguration
+from time import perf_counter, sleep
+from video_streamer.core.ansto.md3_redis_client import MD3RedisClient, NoFrameFoundError, MD3_CAMERA_TIMEOUT
+from io import BytesIO
+
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -339,49 +343,34 @@ class RedisCamera(Camera):
             )
 
         super().__init__(device_uri, sleep_time, debug, None, None)
-        # IMPORTANT (multiprocessing): do not keep Redis sockets open on the camera
-        # instance at construction time, since the camera object is created in the
-        # parent process and then used in a child process.
+        placeholder_path = os.path.join(
+            os.path.dirname(__file__), "ansto", "camera_unavailable.jpg"
+        )
+        self.placeholder_img = Image.open(placeholder_path)
+        # Store placeholder image as raw RGB24 bytes
+        img_rgb = self.placeholder_img
+        if img_rgb.mode != "RGB":
+            img_rgb = img_rgb.convert("RGB")
+        self.placeholder_img_bytes = img_rgb.tobytes()
+        self.camera_args = {
+            "host": "10.244.101.30", #TODO
+            "port": 6379, #TODO
+            "hybrid": "bzoom",
+            "first": "acA2500-x5",
+            "second": "acA2440-x30",
+        }
         self._last_frame_number = -1
         self._in_redis_channel = in_redis_channel
 
-        self._md3_header_format = "<HiiHHQH"
-        self._md3_header_size = struct.calcsize(self._md3_header_format)
+        # self._md3_header_format = "<HiiHHQH"
+        # self._md3_header_size = struct.calcsize(self._md3_header_format)
         self._set_size()
 
-    @contextmanager
-    def _managed_pubsub(self, device_uri: str):
-        client = self._connect(device_uri)
-        pubsub = client.pubsub()
-        try:
-            yield pubsub
-        finally:
-            try:
-                pubsub.close()
-            except Exception:
-                pass
-            try:
-                client.close()
-            except Exception:
-                try:
-                    client.connection_pool.disconnect(inuse_connections=True)
-                except Exception:
-                    pass
 
     def _set_size(self) -> None:
         # The size is sent via Redis; we read a single message to discover it.
-        with self._managed_pubsub(self._device_uri) as pubsub:
-            pubsub.subscribe(self._in_redis_channel)
-            while True:
-                message = pubsub.get_message()
-                if message and message.get("type") == "message":
-                    _, width, height, _, _, _, _ = struct.unpack(
-                        self._md3_header_format,
-                        message["data"][: self._md3_header_size],
-                    )
-                    self._width, self._height = width, height
-                    return
-                time.sleep(0.001)
+        with MD3RedisClient(self.camera_args) as md3_redis_client:
+            raw, self._width, self._height = md3_redis_client._poll_image(MD3_CAMERA_TIMEOUT)
 
     def _connect(self, device_uri: str):
         host, port = device_uri.replace('redis://', '').split(':')
@@ -391,57 +380,55 @@ class RedisCamera(Camera):
     def poll_image(self, output: Union[IO, multiprocessing.queues.Queue]) -> None:
         self._output = output
         # Create the Redis pubsub connection in the *child* process.
-        with self._managed_pubsub(self._device_uri) as pubsub:
-            pubsub.subscribe(self._in_redis_channel)
-
-            try:
-                for message in pubsub.listen():
-                    if message.get("type") != "message":
-                        continue
-
-                    data = message["data"]
-                    _, width, height, _, _, _, _ = struct.unpack(
-                        self._md3_header_format,
-                        data[: self._md3_header_size],
-                    )
-
-                    payload = data[self._md3_header_size :]
-
-                    expected_rgb = width * height * 3
-                    expected_gray = width * height
-
-                    if len(payload) >= expected_rgb:
-                        rgb24 = payload[:expected_rgb]
-                    elif len(payload) >= expected_gray:
-                        gray = Image.frombytes(
-                            "L", (width, height), payload[:expected_gray]
+        while True:
+            with MD3RedisClient(self.camera_args) as md3_redis_client:
+                while True:
+                    try:
+                        frame_bytes = self.get_camera_image(md3_redis_client)
+                        self._write_data(frame_bytes)
+                    except ConnectionError as ce:
+                        logger.error(
+                            f"Redis connection lost: {ce}, reconnecting..."
                         )
-                        rgb24 = gray.convert("RGB").tobytes()
-                    else:
-                        continue
+                        self._emit_placeholder_image(ce)
+                        sleep(0.02)
+                        break
+                    except Exception as e:
+                        logger.error(
+                            f"Error in image generator: {e}"
+                        )
+                        self._emit_placeholder_image(e)
+                        break
 
-                    self._width = width
-                    self._height = height
-                    self._last_frame_number += 1
-
-                    self._write_data(bytearray(rgb24))
-            except KeyboardInterrupt:
-                sys.exit(0)
-            except BrokenPipeError:
-                logger.info(
-                    f"RedisCamera stream ended (broken pipe). Frame number: {self._last_frame_number}"
-                    )
-
-                sys.exit(0)
-            except Exception:
-                logger.exception(
-                    "RedisCamera encountered an error during streaming."
-                    f" Frame number: {self._last_frame_number}"
-                )
-                
                 
                 #raw_image_data = base64.b64decode(raw)                
                 # self._write_data(self._image_to_rgb24(raw))
+    def get_camera_image(self, md3_redis_client: MD3RedisClient) -> bytes:
+        """Get camera image by converting into raw RGB24 format (width*height*3 bytes).
+        If error occurs, a placeholder image is emitted (as JPEG bytes).
+
+        Returns
+        -------
+        bytes
+            Returns the image in raw RGB24 format as bytes. If an error occurs, a placeholder image is returned.
+        """
+        try:
+            imgArray = md3_redis_client.get_frame()
+            self.height = imgArray.height
+            self.width = imgArray.width
+
+            img_rgb = imgArray
+            if img_rgb.mode != "RGB":
+                img_rgb = img_rgb.convert("RGB")
+            return img_rgb.tobytes()
+        except NoFrameFoundError as ex:
+            self._emit_placeholder_image(ex)
+            return self.placeholder_img_bytes
+        
+    def _emit_placeholder_image(self, exception: Exception) -> None:
+        logger.error(f"Emitting placeholder image due to error: {exception}")
+        self._write_data(self.placeholder_img_bytes)
+
 
 class TestCamera(Camera):
     def __init__(self, device_uri: str, sleep_time: float, debug: bool = False, redis: str = None, redis_channel: str = None):
@@ -468,6 +455,8 @@ class TestCamera(Camera):
             self._redis_client.publish(self._redis_channel, json.dumps(frame_dict))
         
         time.sleep(self._sleep_time)
+
+        
 
 class VideoTestCamera(Camera):
     def __init__(self, device_uri: str, sleep_time: float, debug: bool = False, redis: str = None, redis_channel: str = None):
