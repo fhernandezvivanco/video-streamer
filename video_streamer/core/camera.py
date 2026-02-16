@@ -352,9 +352,10 @@ class RedisCamera(Camera):
         if img_rgb.mode != "RGB":
             img_rgb = img_rgb.convert("RGB")
         self.placeholder_img_bytes = img_rgb.tobytes()
+        host, port = device_uri.replace('redis://', '').split(':')
         self.camera_args = {
-            "host": "10.244.101.30", #TODO
-            "port": 6379, #TODO
+            "host": host,
+            "port": int(port),
             "hybrid": "bzoom",
             "first": "acA2500-x5",
             "second": "acA2440-x30",
@@ -372,10 +373,10 @@ class RedisCamera(Camera):
         with MD3RedisClient(self.camera_args) as md3_redis_client:
             raw, self._width, self._height = md3_redis_client._poll_image(MD3_CAMERA_TIMEOUT)
 
-    def _connect(self, device_uri: str):
-        host, port = device_uri.replace('redis://', '').split(':')
-        port = port.split('/')[0]
-        return redis.StrictRedis(host=host, port=int(port))
+    # def _connect(self, device_uri: str):
+    #     host, port = device_uri.replace('redis://', '').split(':')
+    #     port = port.split('/')[0]
+    #     return redis.StrictRedis(host=host, port=int(port))
 
     def poll_image(self, output: Union[IO, multiprocessing.queues.Queue]) -> None:
         self._output = output
@@ -385,7 +386,7 @@ class RedisCamera(Camera):
                 while True:
                     try:
                         frame_bytes = self.get_camera_image(md3_redis_client)
-                        self._write_data(frame_bytes)
+                        self._write_data(bytearray(frame_bytes))
                     except ConnectionError as ce:
                         logger.error(
                             f"Redis connection lost: {ce}, reconnecting..."
@@ -414,8 +415,6 @@ class RedisCamera(Camera):
         """
         try:
             imgArray = md3_redis_client.get_frame()
-            self.height = imgArray.height
-            self.width = imgArray.width
 
             img_rgb = imgArray
             if img_rgb.mode != "RGB":
@@ -427,7 +426,7 @@ class RedisCamera(Camera):
         
     def _emit_placeholder_image(self, exception: Exception) -> None:
         logger.error(f"Emitting placeholder image due to error: {exception}")
-        self._write_data(self.placeholder_img_bytes)
+        self._write_data(bytearray(self.placeholder_img_bytes))
 
 
 class TestCamera(Camera):
