@@ -425,7 +425,6 @@ class RedisCamera(Camera):
                     self._last_frame_number += 1
 
                     self._write_data(bytearray(rgb24))
-                    logger.debug(f"Received frame {self._last_frame_number} with size ({width}x{height})")
             except KeyboardInterrupt:
                 sys.exit(0)
             except BrokenPipeError:
