@@ -373,25 +373,31 @@ class RedisCamera(Camera):
 
 
     def poll_image(self, output: Union[IO, multiprocessing.queues.Queue]) -> None:
+        """
+        Polls the image. The outer while loop ensures that if the connection to redis is lost, 
+        it will keep trying to reconnect and poll images.
+        The inner while loop continuously polls images.
+        """
         self._output = output
-        with MD3RedisClient(self.camera_args) as md3_redis_client:
-            while True:
-                try:
-                    frame_bytes = self.get_camera_image(md3_redis_client)
-                    self._write_data(bytearray(frame_bytes))
-                except ConnectionError as ce:
-                    logger.error(
-                        f"Redis connection lost: {ce}, reconnecting..."
-                    )
-                    self._emit_placeholder_image(ce)
-                    sleep(0.02)
-                    break
-                except Exception as e:
-                    logger.error(
-                        f"Error in image generator: {e}"
-                    )
-                    self._emit_placeholder_image(e)
-                    break
+        while True:
+            with MD3RedisClient(self.camera_args) as md3_redis_client:
+                while True:
+                    try:
+                        frame_bytes = self.get_camera_image(md3_redis_client)
+                        self._write_data(bytearray(frame_bytes))
+                    except ConnectionError as ce:
+                        logger.error(
+                            f"Redis connection lost: {ce}, reconnecting..."
+                        )
+                        self._emit_placeholder_image(ce)
+                        sleep(0.02)
+                        break
+                    except Exception as e:
+                        logger.error(
+                            f"Error in image generator: {e}"
+                        )
+                        self._emit_placeholder_image(e)
+                        break
 
 
     def get_camera_image(self, md3_redis_client: MD3RedisClient) -> bytes:
