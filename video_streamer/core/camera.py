@@ -361,7 +361,7 @@ class RedisCamera(Camera):
             except Exception:
                 pass
             try:
-                client.close()  # type: ignore[attr-defined]
+                client.close()
             except Exception:
                 try:
                     client.connection_pool.disconnect(inuse_connections=True)
